@@ -27,6 +27,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+
 # Poetry
 poetry.lock
 
@@ -135,3 +136,7 @@ dmypy.json
 edge_sim_py/__main__.py
 datasets/
 logs/
+
+# Generated data/plots
+*.csv
+*.png
