@@ -17,7 +17,6 @@ from edge_sim_py.activation_schedulers import DefaultScheduler
 
 
 def dummy_flow_scheduler(topology, flows):
-    # We don't use NetworkFlow in this experiment.
     return
 
 
@@ -29,7 +28,9 @@ def clamp(x, low, high):
     return max(low, min(high, x))
 
 
-# ---------- custom monitored components ----------
+# -----------------------------------------------------
+# ------------------ CUSTOM COMPONENTS -----------------
+# -----------------------------------------------------
 
 class MonitoredBaseStation(BaseStation):
     def collect(self) -> dict:
@@ -62,9 +63,6 @@ class CloudServer(EdgeServer):
         self.total_delay = 0.0
         self.total_net_delay = 0.0
         self.total_proc_delay = 0.0
-        self.avg_delay = 0.0
-        self.avg_net_delay = 0.0
-        self.avg_proc_delay = 0.0
 
     def receive_data(self, data_size, user):
         wireless = user.base_station.wireless_delay if user.base_station else 0.0
@@ -85,19 +83,15 @@ class CloudServer(EdgeServer):
 
         self.request_load += data_size
         self.cpu_util = min(1.0, self.request_load / (self.mips + 1e3))
+
         proc_delay = data_size * 0.02 / (self.mips + 1e-9)
-
         total_delay = net_delay + proc_delay
-        self.energy += data_size * 0.001
 
+        self.energy += data_size * 0.001
         self.total_requests += 1
         self.total_delay += total_delay
         self.total_net_delay += net_delay
         self.total_proc_delay += proc_delay
-
-        self.avg_delay = self.total_delay / self.total_requests
-        self.avg_net_delay = self.total_net_delay / self.total_requests
-        self.avg_proc_delay = self.total_proc_delay / self.total_requests
 
         return {
             "layer": "cloud",
@@ -108,11 +102,14 @@ class CloudServer(EdgeServer):
         }
 
     def collect(self) -> dict:
+        avg_delay = self.total_delay / self.total_requests if self.total_requests else 0
+        avg_net_delay = self.total_net_delay / self.total_requests if self.total_requests else 0
+        avg_proc_delay = self.total_proc_delay / self.total_requests if self.total_requests else 0
+
         return {
             "Instance ID": self.id,
             "Name": self.name,
             "Layer": "cloud",
-            "Coordinates": self.coordinates,
             "CPU": self.cpu,
             "RAM": self.memory,
             "Disk": self.disk,
@@ -120,9 +117,9 @@ class CloudServer(EdgeServer):
             "CPU Util": self.cpu_util,
             "Energy": self.energy,
             "Total Requests": self.total_requests,
-            "Avg Delay": self.avg_delay,
-            "Avg Net Delay": self.avg_net_delay,
-            "Avg Proc Delay": self.avg_proc_delay,
+            "Avg Delay": avg_delay,
+            "Avg Net Delay": avg_net_delay,
+            "Avg Proc Delay": avg_proc_delay,
         }
 
 
@@ -147,9 +144,6 @@ class FogServer(EdgeServer):
         self.total_delay = 0.0
         self.total_net_delay = 0.0
         self.total_proc_delay = 0.0
-        self.avg_delay = 0.0
-        self.avg_net_delay = 0.0
-        self.avg_proc_delay = 0.0
 
     def receive_data(self, data_size, user):
         wireless = user.base_station.wireless_delay if user.base_station else 0.0
@@ -170,19 +164,15 @@ class FogServer(EdgeServer):
 
         self.request_load += data_size
         self.cpu_util = min(1.0, self.request_load / (self.mips + 1e3))
+
         proc_delay = data_size * 0.05 / (self.mips + 1e-9)
-
         total_delay = net_delay + proc_delay
-        self.energy += data_size * 0.0005
 
+        self.energy += data_size * 0.0005
         self.total_requests += 1
         self.total_delay += total_delay
         self.total_net_delay += net_delay
         self.total_proc_delay += proc_delay
-
-        self.avg_delay = self.total_delay / self.total_requests
-        self.avg_net_delay = self.total_net_delay / self.total_requests
-        self.avg_proc_delay = self.total_proc_delay / self.total_requests
 
         return {
             "layer": "fog",
@@ -193,11 +183,14 @@ class FogServer(EdgeServer):
         }
 
     def collect(self) -> dict:
+        avg_delay = self.total_delay / self.total_requests if self.total_requests else 0
+        avg_net_delay = self.total_net_delay / self.total_requests if self.total_requests else 0
+        avg_proc_delay = self.total_proc_delay / self.total_requests if self.total_requests else 0
+
         return {
             "Instance ID": self.id,
             "Name": self.name,
             "Layer": "fog",
-            "Coordinates": self.coordinates,
             "CPU": self.cpu,
             "RAM": self.memory,
             "Disk": self.disk,
@@ -205,14 +198,17 @@ class FogServer(EdgeServer):
             "CPU Util": self.cpu_util,
             "Energy": self.energy,
             "Total Requests": self.total_requests,
-            "Avg Delay": self.avg_delay,
-            "Avg Net Delay": self.avg_net_delay,
-            "Avg Proc Delay": self.avg_proc_delay,
+            "Avg Delay": avg_delay,
+            "Avg Net Delay": avg_net_delay,
+            "Avg Proc Delay": avg_proc_delay,
         }
 
 
+# -----------------------------------------------------
+# ----------------------- USERS -----------------------
+# -----------------------------------------------------
+
 class MovingUser(User):
-    """User whose step() does: mobility + request generation, fully monitored via collect()."""
 
     def __init__(self, obj_id=None,
                  area_width=800,
@@ -234,19 +230,16 @@ class MovingUser(User):
         self.sla_violation_rate = 0.0
 
         self.last_delay = 0.0
-        self.last_net_delay = 0.0
-        self.last_proc_delay = 0.0
-        self.last_server_layer = None
         self.last_server_name = None
-        self.distance_to_nearest_fog = 0.0
+        self.last_server_layer = None
 
     def _init_position(self):
         self.x = random.randint(0, self.area_width)
         self.y = random.randint(0, self.area_height)
         self.coordinates = [self.x, self.y]
 
-        bss = BaseStation.all()
-        nearest = min(bss, key=lambda bs: dist(self.coordinates, bs.coordinates))
+        all_bs = BaseStation.all()
+        nearest = min(all_bs, key=lambda bs: dist(self.coordinates, bs.coordinates))
         self.base_station = nearest
         nearest.users.append(self)
 
@@ -262,23 +255,47 @@ class MovingUser(User):
         if self.base_station is not nearest:
             if self.base_station and self in self.base_station.users:
                 self.base_station.users.remove(self)
-            self.base_station = nearest
             nearest.users.append(self)
+            self.base_station = nearest
+
+    # -----------------------------------------------------
+    # --------- MARKOV PREDICTION FOR SERVER --------------
+    # -----------------------------------------------------
+    def _predict_server_markov(self):
+        if self.last_server_name is None:
+            return None
+
+        M = self.model.markov_matrix
+        if self.last_server_name not in M:
+            return None
+
+        transitions = M[self.last_server_name]
+        servers = list(transitions.keys())
+        probs = list(transitions.values())
+
+        return random.choices(servers, probs)[0]
 
     def _select_server(self):
-        fog_servers = self.model.fog_servers
+        fogs = self.model.fog_servers
         cloud = self.model.cloud_server
-        max_fog_distance = self.model.max_fog_distance
+        fog_names = [f.name for f in fogs]
 
-        ux, uy = self.x, self.y
-        nearest_fog = min(
-            fog_servers,
-            key=lambda f: dist((ux, uy), tuple(f.base_station.coordinates))
-        )
-        d = dist((ux, uy), tuple(nearest_fog.base_station.coordinates))
+        # Markov prediction
+        predicted = self._predict_server_markov()
 
-        if d <= max_fog_distance:
+        if predicted in fog_names:
+            fog = next(f for f in fogs if f.name == predicted)
+            d = dist(self.coordinates, fog.base_station.coordinates)
+            if d <= self.model.max_fog_distance:
+                return fog, d
+
+        # fallback nearest fog
+        nearest_fog = min(fogs, key=lambda f: dist(self.coordinates, f.base_station.coordinates))
+        d = dist(self.coordinates, nearest_fog.base_station.coordinates)
+
+        if d <= self.model.max_fog_distance:
             return nearest_fog, d
+
         return cloud, d
 
     def step(self):
@@ -286,44 +303,36 @@ class MovingUser(User):
             self._init_position()
 
         self._move()
-
         data_size = random.randint(self.data_size_min, self.data_size_max)
+
         server, d = self._select_server()
         stats = server.receive_data(data_size, self)
 
-        delay_sla = self.model.delay_sla
-        sla_violated = stats["delay"] > delay_sla
+        self.last_server_name = stats["server"]
+        self.last_server_layer = stats["layer"]
 
+        sla_violated = stats["delay"] > self.model.delay_sla
         self.total_requests += 1
         if sla_violated:
             self.sla_violations += 1
         self.sla_violation_rate = self.sla_violations / self.total_requests
 
         self.last_delay = stats["delay"]
-        self.last_net_delay = stats["net_delay"]
-        self.last_proc_delay = stats["proc_delay"]
-        self.last_server_layer = stats["layer"]
-        self.last_server_name = stats["server"]
-        self.distance_to_nearest_fog = d
 
-    def collect(self) -> dict:
+    def collect(self):
         return {
             "Instance ID": self.id,
             "Coordinates": self.coordinates,
             "Base Station": self.base_station.id if self.base_station else None,
-            "Total Requests": self.total_requests,
-            "SLA Violations": self.sla_violations,
-            "SLA Violation Rate": self.sla_violation_rate,
+            "Last Server": self.last_server_name,
             "Last Delay": self.last_delay,
-            "Last Net Delay": self.last_net_delay,
-            "Last Proc Delay": self.last_proc_delay,
-            "Last Server Layer": self.last_server_layer,
-            "Last Server Name": self.last_server_name,
-            "Distance to Nearest Fog": self.distance_to_nearest_fog,
+            "SLA Violation Rate": self.sla_violation_rate,
         }
 
 
-# ---------- resource management + stopping criterion ----------
+# -----------------------------------------------------
+# ---------------- SIM, INFRASTRUCTURE ----------------
+# -----------------------------------------------------
 
 def noop_resource_management(parameters: dict):
     return
@@ -333,20 +342,18 @@ def stopping_criterion(model: Simulator) -> bool:
     return model.schedule.steps >= model.max_steps
 
 
-# ---------- build infrastructure ----------
-
 def build_infrastructure(sim: Simulator,
                          fog_coords=None,
                          wireless_delay=5.0,
                          link_delay=5.0,
                          link_bandwidth=10000):
+
     if fog_coords is None:
         fog_coords = [(0, 0), (250, 0), (500, 0), (750, 0)]
 
     topo = sim.initialize_agent(Topology())
     sim.topology = topo
 
-    base_stations = []
     switches = []
     fog_servers = []
 
@@ -359,20 +366,18 @@ def build_infrastructure(sim: Simulator,
         sw = NetworkSwitch()
         sim.initialize_agent(sw)
         bs._connect_to_network_switch(sw)
-
         topo.add_node(sw)
 
         fog = FogServer(name=f"Fog-{i}")
         sim.initialize_agent(fog)
         bs._connect_to_edge_server(fog)
 
-        base_stations.append(bs)
         switches.append(sw)
         fog_servers.append(fog)
 
     cloud = CloudServer()
     sim.initialize_agent(cloud)
-    base_stations[0]._connect_to_edge_server(cloud)
+    BaseStation.all()[0]._connect_to_edge_server(cloud)
 
     for i in range(len(switches) - 1):
         sw1 = switches[i]
@@ -383,6 +388,7 @@ def build_infrastructure(sim: Simulator,
         link.nodes = [sw1, sw2]
         link.delay = link_delay
         link.bandwidth = link_bandwidth
+
         topo.add_edge(sw1, sw2)
         topo._adj[sw1][sw2] = link
         topo._adj[sw2][sw1] = link
@@ -393,100 +399,24 @@ def build_infrastructure(sim: Simulator,
     sim.fog_servers = fog_servers
     sim.cloud_server = cloud
 
-    return base_stations, switches, fog_servers, cloud
+    return fog_servers
 
 
-def create_users(sim: Simulator,
-                 n_users=50,
-                 area_width=800,
-                 area_height=200,
-                 data_size_min=100,
-                 data_size_max=1000):
+def create_users(sim, n_users=50, area_width=800, area_height=200):
     users = []
     for i in range(1, n_users + 1):
-        u = MovingUser(
-            obj_id=i,
-            area_width=area_width,
-            area_height=area_height,
-            data_size_min=data_size_min,
-            data_size_max=data_size_max,
-            move_speed=10,  # Increased movement speed
-        )
+        u = MovingUser(obj_id=i,
+                       area_width=area_width,
+                       area_height=area_height,
+                       move_speed=10)
         sim.initialize_agent(u)
         users.append(u)
     return users
 
 
-# ---------- main experiment ----------
-
-def run_experiment_markov_edgesimpy(
-    n_users=50,
-    max_steps=1000,
-    area_width=800,
-    area_height=200,
-    data_size_min=100,
-    data_size_max=1000,
-    fog_coords=None,
-    max_fog_distance=200.0,
-    delay_sla=100.0,
-    seed=0,
-):
-    random.seed(seed)
-
-    sim = Simulator(
-        stopping_criterion=stopping_criterion,
-        resource_management_algorithm=noop_resource_management,
-        resource_management_algorithm_parameters={},
-        user_defined_functions=[],
-        network_flow_scheduling_algorithm=dummy_flow_scheduler,
-        tick_duration=1,
-        tick_unit="seconds",
-        scheduler=DefaultScheduler,
-        dump_interval=float("inf"),
-        logs_directory="logs_markov_edgesimpy",
-    )
-
-    sim.max_steps = max_steps
-    sim.max_fog_distance = max_fog_distance
-    sim.delay_sla = delay_sla
-
-    base_stations, switches, fog_servers, cloud = build_infrastructure(
-        sim,
-        fog_coords=fog_coords,
-        wireless_delay=5.0,
-        link_delay=5.0,
-        link_bandwidth=10000,
-    )
-
-    users = create_users(
-        sim,
-        n_users=n_users,
-        area_width=area_width,
-        area_height=area_height,
-        data_size_min=data_size_min,
-        data_size_max=data_size_max,
-    )
-
-    sim.run_model()
-
-    # All stats from built-in monitoring
-    df_servers = pd.DataFrame(
-        sim.agent_metrics.get("CloudServer", []) +
-        sim.agent_metrics.get("FogServer", [])
-    )
-
-    df_users = pd.DataFrame(
-        sim.agent_metrics.get("MovingUser", [])
-    )
-
-    df_bss = pd.DataFrame(
-        sim.agent_metrics.get("MonitoredBaseStation", [])
-    )
-
-    return sim, df_servers, df_users, df_bss
-
-
-# ---------- plotting from built-in stats ----------
+# -----------------------------------------------------
+# --------------------- VISUALIZATION -----------------
+# -----------------------------------------------------
 
 def plot_server_cpu(df_servers, ax):
     if df_servers.empty:
@@ -507,7 +437,7 @@ def plot_server_energy(df_servers, ax):
         ax.plot(grp["Time Step"], grp["Energy"], label=name)
     ax.set_title("Server Energy over Time")
     ax.set_xlabel("Time Step")
-    ax.set_ylabel("Energy (accumulated)")
+    ax.set_ylabel("Energy")
     ax.legend()
     ax.grid(True)
 
@@ -518,9 +448,9 @@ def plot_avg_delay_by_layer(df_servers, ax):
     df = df_servers.groupby(["Time Step", "Layer"])["Avg Delay"].mean().reset_index()
     for layer, grp in df.groupby("Layer"):
         ax.plot(grp["Time Step"], grp["Avg Delay"], label=layer)
-    ax.set_title("Average Delay per Layer over Time")
+    ax.set_title("Average Delay per Layer")
     ax.set_xlabel("Time Step")
-    ax.set_ylabel("Average Delay")
+    ax.set_ylabel("Avg Delay")
     ax.legend()
     ax.grid(True)
 
@@ -530,7 +460,7 @@ def plot_sla_violation_rate(df_users, ax):
         return
     df = df_users.groupby("Time Step")["SLA Violation Rate"].mean().reset_index()
     ax.plot(df["Time Step"], df["SLA Violation Rate"])
-    ax.set_title("Average SLA Violation Rate over Time (Users)")
+    ax.set_title("Average SLA Violation Rate (Users)")
     ax.set_xlabel("Time Step")
     ax.set_ylabel("SLA Violation Rate")
     ax.grid(True)
@@ -541,9 +471,9 @@ def plot_bs_load(df_bss, ax):
         return
     for bs_id, grp in df_bss.groupby("Instance ID"):
         ax.plot(grp["Time Step"], grp["Num Users"], label=f"BS-{bs_id}")
-    ax.set_title("Number of Users per Base Station over Time")
+    ax.set_title("Number of Users per Base Station")
     ax.set_xlabel("Time Step")
-    ax.set_ylabel("Num Users")
+    ax.set_ylabel("Users")
     ax.legend()
     ax.grid(True)
 
@@ -551,18 +481,74 @@ def plot_bs_load(df_bss, ax):
 def plot_reallocations(df_users, ax):
     if df_users.empty:
         return
-    # For each user, find where the Base Station ID changes from the previous step
-    df_users['prev_bs'] = df_users.groupby('Instance ID')['Base Station'].shift(1)
-    reallocations = df_users[df_users['Base Station'] != df_users['prev_bs']]
 
-    # Count reallocations per time step
-    reallocations_by_step = reallocations.groupby('Time Step').size().reset_index(name='counts')
+    df_users["PrevBS"] = df_users.groupby("Instance ID")["Base Station"].shift(1)
+    realloc = df_users[df_users["Base Station"] != df_users["PrevBS"]]
 
-    ax.plot(reallocations_by_step["Time Step"], reallocations_by_step["counts"])
-    ax.set_title("User Reallocations (Handoffs) over Time")
+    counts = realloc.groupby("Time Step").size().reset_index(name="handoffs")
+
+    ax.plot(counts["Time Step"], counts["handoffs"])
+    ax.set_title("User Handoffs Per Time Step")
     ax.set_xlabel("Time Step")
-    ax.set_ylabel("Number of Reallocations")
+    ax.set_ylabel("Handoffs")
     ax.grid(True)
+
+
+
+# -----------------------------------------------------
+# --------------------- MAIN EXPERIMENT ---------------
+# -----------------------------------------------------
+
+def run_experiment_markov_edgesimpy(
+    n_users=50,
+    max_steps=500,
+    max_fog_distance=200.0,
+    delay_sla=100.0,
+):
+
+    random.seed(0)
+
+    sim = Simulator(
+        stopping_criterion=stopping_criterion,
+        resource_management_algorithm=noop_resource_management,
+        resource_management_algorithm_parameters={},
+        user_defined_functions=[],
+        network_flow_scheduling_algorithm=dummy_flow_scheduler,
+        tick_duration=1,
+        tick_unit="seconds",
+        scheduler=DefaultScheduler,
+        dump_interval=float("inf"),
+        logs_directory="logs_markov_edgesimpy",
+    )
+
+    sim.max_steps = max_steps
+    sim.max_fog_distance = max_fog_distance
+    sim.delay_sla = delay_sla
+
+    fog_servers = build_infrastructure(sim)
+    users = create_users(sim, n_users)
+
+    # -----------------------------------------------------
+    # --------------------- MARKOV MATRIX -----------------
+    # -----------------------------------------------------
+    sim.markov_matrix = {
+        "Fog-1": {"Fog-1": 0.7, "Fog-2": 0.2, "Cloud": 0.1},
+        "Fog-2": {"Fog-2": 0.7, "Fog-1": 0.1, "Fog-3": 0.2},
+        "Fog-3": {"Fog-3": 0.7, "Fog-2": 0.2, "Fog-4": 0.1},
+        "Fog-4": {"Fog-4": 0.6, "Fog-3": 0.3, "Cloud": 0.1},
+        "Cloud": {"Cloud": 0.8, "Fog-1": 0.2},
+    }
+
+    sim.run_model()
+
+    df_servers = pd.DataFrame(
+        sim.agent_metrics.get("CloudServer", []) +
+        sim.agent_metrics.get("FogServer", [])
+    )
+    df_users = pd.DataFrame(sim.agent_metrics.get("MovingUser", []))
+    df_bs = pd.DataFrame(sim.agent_metrics.get("MonitoredBaseStation", []))
+
+    return sim, df_servers, df_users, df_bs
 
 
 if __name__ == "__main__":
@@ -571,22 +557,21 @@ if __name__ == "__main__":
     df_srv.to_csv("experiment_markov_servers_built_in.csv", index=False)
     df_usr.to_csv("experiment_markov_users_built_in.csv", index=False)
     df_bs.to_csv("experiment_markov_basestations_built_in.csv", index=False)
-    print("Saved CSVs for servers, users, base stations (built-in stats).")
 
-    # Create a single figure with a 3x2 grid of subplots
+    print("Saved CSVs for servers, users, base stations.")
+
     fig, axes = plt.subplots(3, 2, figsize=(18, 15))
-    fig.suptitle('Simulation Results Dashboard', fontsize=16)
+    fig.suptitle("Simulation Results Dashboard (Markov Model)", fontsize=16)
 
-    # Plot each graph on its respective subplot
-    plot_server_cpu(df_srv, ax=axes[0, 0])
-    plot_server_energy(df_srv, ax=axes[0, 1])
-    plot_avg_delay_by_layer(df_srv, ax=axes[1, 0])
-    plot_sla_violation_rate(df_usr, ax=axes[1, 1])
-    plot_bs_load(df_bs, ax=axes[2, 0])
-    plot_reallocations(df_usr, ax=axes[2, 1])
+    plot_server_cpu(df_srv, axes[0, 0])
+    plot_server_energy(df_srv, axes[0, 1])
+    plot_avg_delay_by_layer(df_srv, axes[1, 0])
+    plot_sla_violation_rate(df_usr, axes[1, 1])
+    plot_bs_load(df_bs, axes[2, 0])
+    plot_reallocations(df_usr, axes[2, 1])
 
-    # Adjust layout to prevent titles/labels overlapping and show the plot
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig("simulation_dashboard.png")
-    print("Saved combined plot to simulation_dashboard.png")
+    plt.savefig("simulation_dashboard_markov.png")
+    print("Saved dashboard → simulation_dashboard_markov.png")
+
     plt.show()
