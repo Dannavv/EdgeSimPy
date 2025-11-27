@@ -68,7 +68,12 @@ class CloudServer(EdgeServer):
         wireless = user.base_station.wireless_delay if user.base_station else 0.0
 
         topo = self.model.topology
-        if user.base_station and self.base_station:
+        if (
+            user.base_station
+            and self.base_station
+            and user.base_station.network_switch in topo
+            and self.base_station.network_switch in topo
+        ):
             path_switches = nx.shortest_path(
                 G=topo,
                 source=user.base_station.network_switch,
@@ -78,6 +83,7 @@ class CloudServer(EdgeServer):
             path_delay = topo.calculate_path_delay(path_switches)
         else:
             path_delay = 0.0
+
 
         net_delay = wireless + path_delay
 
@@ -149,7 +155,12 @@ class FogServer(EdgeServer):
         wireless = user.base_station.wireless_delay if user.base_station else 0.0
 
         topo = self.model.topology
-        if user.base_station and self.base_station:
+        if (
+            user.base_station
+            and self.base_station
+            and user.base_station.network_switch in topo
+            and self.base_station.network_switch in topo
+        ):
             path_switches = nx.shortest_path(
                 G=topo,
                 source=user.base_station.network_switch,
@@ -165,7 +176,7 @@ class FogServer(EdgeServer):
         self.request_load += data_size
         self.cpu_util = min(1.0, self.request_load / (self.mips + 1e3))
 
-        proc_delay = data_size * 0.05 / (self.mips + 1e-9)
+        proc_delay = (data_size * 0.05) / (self.mips + 1e-9)
         total_delay = net_delay + proc_delay
 
         self.energy += data_size * 0.0005
@@ -275,78 +286,28 @@ class MovingUser(User):
 
         return random.choices(servers, probs)[0]
 
-    def _reallocate_server_markov(self, fogs, cloud):
-        # Candidates C: fogs within a search radius around the user
-        search_radius = getattr(self.model, "realloc_search_radius",
-                                self.model.max_fog_distance * 1.5)
-
-        candidates = []
-        for f in fogs:
-            d = dist(self.coordinates, f.base_station.coordinates)
-            if d <= search_radius:
-                candidates.append((f, d))
-
-        # No candidate fogs -> fall back to cloud
-        if not candidates:
-            return cloud, 0.0
-
-        # Try to use Markov row P_{lj, ca} (leaving fog -> candidate fog)
-        markov = getattr(self.model, "markov_matrix", None)
-        if self.last_server_name and markov and self.last_server_name in markov:
-            row = markov[self.last_server_name]  # dict: fog_name -> prob
-
-            fog_names = [f.name for f, _ in candidates]
-            probs = []
-            total_p = 0.0
-
-            for name in fog_names:
-                p = row.get(name, 0.0)
-                probs.append(p)
-                total_p += p
-
-            if total_p > 0:
-                probs = [p / total_p for p in probs]
-                idx = random.choices(range(len(candidates)), probs)[0]
-                return candidates[idx]
-
-        # If Markov row not defined or all zero -> fallback: nearest fog
-        f, d = min(candidates, key=lambda fd: fd[1])
-        return f, d
-
-
     def _select_server(self):
         fogs = self.model.fog_servers
         cloud = self.model.cloud_server
+        fog_names = [f.name for f in fogs]
 
-        # 1. If last server was a fog and still within coverage, keep it (no reallocation)
-        last_fog = None
-        if self.last_server_layer == "fog" and self.last_server_name is not None:
-            for f in fogs:
-                if f.name == self.last_server_name:
-                    last_fog = f
-                    break
+        # Markov prediction
+        predicted = self._predict_server_markov()
 
-        if last_fog is not None:
-            d_last = dist(self.coordinates, last_fog.base_station.coordinates)
-            if d_last <= self.model.max_fog_distance:
-                # Equivalent to ST=1 and no reallocation needed
-                return last_fog, d_last
-
-        # 2. Otherwise, we consider that the previous fog "left the VS" for this user
-        #    -> do Markov-based reallocation among available fogs
-        server, d = self._reallocate_server_markov(fogs, cloud)
-
-        # 3. If the selected fog is still too far (beyond hard SLA constraint),
-        #    send to cloud as a last resort
-        if isinstance(server, FogServer):
+        if predicted in fog_names:
+            fog = next(f for f in fogs if f.name == predicted)
+            d = dist(self.coordinates, fog.base_station.coordinates)
             if d <= self.model.max_fog_distance:
-                return server, d
-            else:
-                return cloud, d
+                return fog, d
 
-        # server is cloud
-        return server, d
+        # fallback nearest fog
+        nearest_fog = min(fogs, key=lambda f: dist(self.coordinates, f.base_station.coordinates))
+        d = dist(self.coordinates, nearest_fog.base_station.coordinates)
 
+        if d <= self.model.max_fog_distance:
+            return nearest_fog, d
+
+        return cloud, d
 
     def step(self):
         if self.base_station is None:
@@ -590,8 +551,6 @@ def run_experiment_markov_edgesimpy(
     sim.max_steps = max_steps
     sim.max_fog_distance = max_fog_distance
     sim.delay_sla = delay_sla
-    sim.realloc_search_radius = max_fog_distance * 1.5
-
 
     fog_servers = build_infrastructure(sim, fog_mips=fog_mips)
     users = create_users(sim,
@@ -653,4 +612,4 @@ if __name__ == "__main__":
     plt.savefig("simulation_dashboard_markov.png")
     print("Saved dashboard → simulation_dashboard_markov.png")
 
-    # plt.show()
+    plt.show()

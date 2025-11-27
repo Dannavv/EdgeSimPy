@@ -1,5 +1,6 @@
 import math
 import random
+import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -15,6 +16,10 @@ from edge_sim_py.components import (
 )
 from edge_sim_py.activation_schedulers import DefaultScheduler
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 
 def dummy_flow_scheduler(topology, flows):
     return
@@ -29,7 +34,22 @@ def clamp(x, low, high):
 
 
 # -----------------------------------------------------
-# ------------------ CUSTOM COMPONENTS -----------------
+# ----------------- SERVER ID MAPPING -----------------
+# -----------------------------------------------------
+
+SERVER_IDS = {
+    "Fog-1": 0,
+    "Fog-2": 1,
+    "Fog-3": 2,
+    "Fog-4": 3,
+    "Cloud": 4,
+}
+ID_TO_SERVER = {v: k for k, v in SERVER_IDS.items()}
+N_SERVERS = len(SERVER_IDS)
+
+
+# -----------------------------------------------------
+# ------------------ CUSTOM COMPONENTS ----------------
 # -----------------------------------------------------
 
 class MonitoredBaseStation(BaseStation):
@@ -68,7 +88,12 @@ class CloudServer(EdgeServer):
         wireless = user.base_station.wireless_delay if user.base_station else 0.0
 
         topo = self.model.topology
-        if user.base_station and self.base_station:
+        if (
+            user.base_station
+            and self.base_station
+            and user.base_station.network_switch in topo
+            and self.base_station.network_switch in topo
+        ):
             path_switches = nx.shortest_path(
                 G=topo,
                 source=user.base_station.network_switch,
@@ -149,7 +174,12 @@ class FogServer(EdgeServer):
         wireless = user.base_station.wireless_delay if user.base_station else 0.0
 
         topo = self.model.topology
-        if user.base_station and self.base_station:
+        if (
+            user.base_station
+            and self.base_station
+            and user.base_station.network_switch in topo
+            and self.base_station.network_switch in topo
+        ):
             path_switches = nx.shortest_path(
                 G=topo,
                 source=user.base_station.network_switch,
@@ -165,7 +195,7 @@ class FogServer(EdgeServer):
         self.request_load += data_size
         self.cpu_util = min(1.0, self.request_load / (self.mips + 1e3))
 
-        proc_delay = data_size * 0.05 / (self.mips + 1e-9)
+        proc_delay = (data_size * 0.05) / (self.mips + 1e-9)
         total_delay = net_delay + proc_delay
 
         self.energy += data_size * 0.0005
@@ -205,6 +235,23 @@ class FogServer(EdgeServer):
 
 
 # -----------------------------------------------------
+# ----------------- LSTM SERVER SELECTOR --------------
+# -----------------------------------------------------
+
+class LSTMServerSelector(nn.Module):
+    def __init__(self, input_dim=4, hidden_dim=32, num_layers=1, num_classes=N_SERVERS):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]
+        logits = self.fc(last)
+        return logits
+
+
+# -----------------------------------------------------
 # ----------------------- USERS -----------------------
 # -----------------------------------------------------
 
@@ -233,6 +280,13 @@ class MovingUser(User):
         self.last_server_name = None
         self.last_server_layer = None
 
+        self.history = []
+        self.prev_x = None
+        self.prev_y = None
+
+        self.lstm_correct_predictions = 0
+        self.lstm_total_predictions = 0
+
     def _init_position(self):
         self.x = random.randint(0, self.area_width)
         self.y = random.randint(0, self.area_height)
@@ -244,6 +298,9 @@ class MovingUser(User):
         nearest.users.append(self)
 
     def _move(self):
+        self.prev_x = self.x
+        self.prev_y = self.y
+
         self.x += random.randint(-self.move_speed, self.move_speed)
         self.y += random.randint(-self.move_speed, self.move_speed)
         self.x = clamp(self.x, 0, self.area_width)
@@ -258,104 +315,138 @@ class MovingUser(User):
             nearest.users.append(self)
             self.base_station = nearest
 
-    # -----------------------------------------------------
-    # --------- MARKOV PREDICTION FOR SERVER --------------
-    # -----------------------------------------------------
-    def _predict_server_markov(self):
-        if self.last_server_name is None:
-            return None
+    def _build_features(self):
+        ax = self.area_width or 1
+        ay = self.area_height or 1
+        x_norm = self.x / ax
+        y_norm = self.y / ay
 
-        M = self.model.markov_matrix
-        if self.last_server_name not in M:
-            return None
+        if self.prev_x is None or self.prev_y is None:
+            dx, dy = 0.0, 0.0
+        else:
+            dx = self.x - self.prev_x
+            dy = self.y - self.prev_y
 
-        transitions = M[self.last_server_name]
-        servers = list(transitions.keys())
-        probs = list(transitions.values())
+        mag = math.sqrt(dx * dx + dy * dy) + 1e-9
+        cos_t = dx / mag
+        sin_t = dy / mag
 
-        return random.choices(servers, probs)[0]
+        return [x_norm, y_norm, cos_t, sin_t]
 
-    def _reallocate_server_markov(self, fogs, cloud):
-        # Candidates C: fogs within a search radius around the user
-        search_radius = getattr(self.model, "realloc_search_radius",
-                                self.model.max_fog_distance * 1.5)
+    def _update_history(self):
+        feat = self._build_features()
+        self.history.append(feat)
+        H = self.model.seq_len
+        if len(self.history) > H:
+            self.history = self.history[-H:]
 
-        candidates = []
-        for f in fogs:
-            d = dist(self.coordinates, f.base_station.coordinates)
-            if d <= search_radius:
-                candidates.append((f, d))
-
-        # No candidate fogs -> fall back to cloud
-        if not candidates:
-            return cloud, 0.0
-
-        # Try to use Markov row P_{lj, ca} (leaving fog -> candidate fog)
-        markov = getattr(self.model, "markov_matrix", None)
-        if self.last_server_name and markov and self.last_server_name in markov:
-            row = markov[self.last_server_name]  # dict: fog_name -> prob
-
-            fog_names = [f.name for f, _ in candidates]
-            probs = []
-            total_p = 0.0
-
-            for name in fog_names:
-                p = row.get(name, 0.0)
-                probs.append(p)
-                total_p += p
-
-            if total_p > 0:
-                probs = [p / total_p for p in probs]
-                idx = random.choices(range(len(candidates)), probs)[0]
-                return candidates[idx]
-
-        # If Markov row not defined or all zero -> fallback: nearest fog
-        f, d = min(candidates, key=lambda fd: fd[1])
-        return f, d
-
-
-    def _select_server(self):
+    def _oracle_best_server(self):
         fogs = self.model.fog_servers
         cloud = self.model.cloud_server
 
-        # 1. If last server was a fog and still within coverage, keep it (no reallocation)
-        last_fog = None
-        if self.last_server_layer == "fog" and self.last_server_name is not None:
-            for f in fogs:
-                if f.name == self.last_server_name:
-                    last_fog = f
-                    break
+        candidates = []
 
-        if last_fog is not None:
-            d_last = dist(self.coordinates, last_fog.base_station.coordinates)
-            if d_last <= self.model.max_fog_distance:
-                # Equivalent to ST=1 and no reallocation needed
-                return last_fog, d_last
+        for f in fogs:
+            d = dist(self.coordinates, f.base_station.coordinates)
+            if d > self.model.max_fog_distance:
+                continue
 
-        # 2. Otherwise, we consider that the previous fog "left the VS" for this user
-        #    -> do Markov-based reallocation among available fogs
-        server, d = self._reallocate_server_markov(fogs, cloud)
-
-        # 3. If the selected fog is still too far (beyond hard SLA constraint),
-        #    send to cloud as a last resort
-        if isinstance(server, FogServer):
-            if d <= self.model.max_fog_distance:
-                return server, d
+            wireless = self.base_station.wireless_delay if self.base_station else 0.0
+            topo = self.model.topology
+            if (self.base_station and f.base_station and
+                self.base_station.network_switch in topo and
+                f.base_station.network_switch in topo):
+                path_switches = nx.shortest_path(
+                    G=topo,
+                    source=self.base_station.network_switch,
+                    target=f.base_station.network_switch,
+                    weight="delay",
+                )
+                path_delay = topo.calculate_path_delay(path_switches)
             else:
-                return cloud, d
+                path_delay = 0.0
 
-        # server is cloud
-        return server, d
+            net_delay = wireless + path_delay
+            proc_delay = (500.0 * 0.05) / (f.mips + 1e-9)
+            total_delay = net_delay + proc_delay
 
+            candidates.append((f, total_delay))
+
+        wireless = self.base_station.wireless_delay if self.base_station else 0.0
+        topo = self.model.topology
+        cloud_bs = cloud.base_station
+        if (self.base_station and cloud_bs and
+            self.base_station.network_switch in topo and
+            cloud_bs.network_switch in topo):
+            path_switches = nx.shortest_path(
+                G=topo,
+                source=self.base_station.network_switch,
+                target=cloud_bs.network_switch,
+                weight="delay",
+            )
+            path_delay = topo.calculate_path_delay(path_switches)
+        else:
+            path_delay = 0.0
+
+        net_delay_c = wireless + path_delay
+        proc_delay_c = (500.0 * 0.02) / (cloud.mips + 1e-9)
+        total_delay_c = net_delay_c + proc_delay_c
+        candidates.append((cloud, total_delay_c))
+
+        best_server, _ = min(candidates, key=lambda sd: sd[1])
+        return best_server
+
+    def _predict_server_lstm_and_train(self, oracle_server):
+        model = self.model.lstm_model
+        optimizer = self.model.lstm_optimizer
+        loss_fn = self.model.lstm_loss_fn
+        server_ids = self.model.server_ids
+
+        H = self.model.seq_len
+        if len(self.history) < H:
+            return oracle_server.name
+
+        seq = np.array(self.history[-H:], dtype="float32")
+        x = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+
+        logits = model(x)
+        pred_id = int(torch.argmax(logits, dim=1).item())
+        pred_name = self.model.id_to_server[pred_id]
+
+        target_id = server_ids[oracle_server.name]
+        target = torch.tensor([target_id], dtype=torch.long)
+
+        loss = loss_fn(logits, target)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        self.lstm_total_predictions += 1
+        self.model.lstm_step += 1
+        if pred_name == oracle_server.name:
+            self.lstm_correct_predictions += 1
+            self.model.lstm_correct += 1
+
+        if self.model.lstm_step > 0:
+            acc = self.model.lstm_correct / self.model.lstm_step
+            step_idx = self.model.schedule.steps
+            self.model.lstm_history.append((step_idx, acc))
+
+        return pred_name
 
     def step(self):
         if self.base_station is None:
             self._init_position()
 
         self._move()
+        self._update_history()
+
         data_size = random.randint(self.data_size_min, self.data_size_max)
 
-        server, d = self._select_server()
+        oracle_server = self._oracle_best_server()
+        _ = self._predict_server_lstm_and_train(oracle_server)
+
+        server = oracle_server
         stats = server.receive_data(data_size, self)
 
         self.last_server_name = stats["server"]
@@ -541,6 +632,7 @@ def plot_reallocations(df_users, ax):
     if df_users.empty:
         return
 
+    df_users = df_users.copy()
     df_users["PrevBS"] = df_users.groupby("Instance ID")["Base Station"].shift(1)
     realloc = df_users[df_users["Base Station"] != df_users["PrevBS"]]
 
@@ -553,12 +645,21 @@ def plot_reallocations(df_users, ax):
     ax.grid(True)
 
 
+def plot_lstm_accuracy(df_acc, ax):
+    if df_acc.empty:
+        return
+    ax.plot(df_acc["Time Step"], df_acc["Accuracy"])
+    ax.set_title("LSTM Prediction Accuracy Over Time")
+    ax.set_xlabel("Time Step")
+    ax.set_ylabel("Accuracy")
+    ax.grid(True)
+
 
 # -----------------------------------------------------
-# --------------------- MAIN EXPERIMENT ---------------
+# ------------------ MAIN EXPERIMENT ------------------
 # -----------------------------------------------------
 
-def run_experiment_markov_edgesimpy(
+def run_experiment_lstm_edgesimpy(
     n_users=50,
     max_steps=500,
     max_fog_distance=200.0,
@@ -573,6 +674,8 @@ def run_experiment_markov_edgesimpy(
 ):
 
     random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     sim = Simulator(
         stopping_criterion=stopping_criterion,
@@ -584,14 +687,25 @@ def run_experiment_markov_edgesimpy(
         tick_unit="seconds",
         scheduler=DefaultScheduler,
         dump_interval=float("inf"),
-        logs_directory="logs_markov_edgesimpy",
+        logs_directory="logs_lstm_edgesimpy",
     )
 
     sim.max_steps = max_steps
     sim.max_fog_distance = max_fog_distance
     sim.delay_sla = delay_sla
-    sim.realloc_search_radius = max_fog_distance * 1.5
 
+    sim.seq_len = 5
+    sim.lstm_model = LSTMServerSelector(input_dim=4)
+    sim.lstm_model.train()
+    sim.lstm_optimizer = optim.Adam(sim.lstm_model.parameters(), lr=1e-3)
+    sim.lstm_loss_fn = nn.CrossEntropyLoss()
+
+    sim.server_ids = SERVER_IDS
+    sim.id_to_server = ID_TO_SERVER
+
+    sim.lstm_step = 0
+    sim.lstm_correct = 0
+    sim.lstm_history = []
 
     fog_servers = build_infrastructure(sim, fog_mips=fog_mips)
     users = create_users(sim,
@@ -602,17 +716,6 @@ def run_experiment_markov_edgesimpy(
                          data_size_min=data_size_min,
                          data_size_max=data_size_max)
 
-    # -----------------------------------------------------
-    # --------------------- MARKOV MATRIX -----------------
-    # -----------------------------------------------------
-    sim.markov_matrix = {
-        "Fog-1": {"Fog-1": 0.7, "Fog-2": 0.2, "Cloud": 0.1},
-        "Fog-2": {"Fog-2": 0.7, "Fog-1": 0.1, "Fog-3": 0.2},
-        "Fog-3": {"Fog-3": 0.7, "Fog-2": 0.2, "Fog-4": 0.1},
-        "Fog-4": {"Fog-4": 0.6, "Fog-3": 0.3, "Cloud": 0.1},
-        "Cloud": {"Cloud": 0.8, "Fog-1": 0.2},
-    }
-
     sim.run_model()
 
     df_servers = pd.DataFrame(
@@ -622,25 +725,37 @@ def run_experiment_markov_edgesimpy(
     df_users = pd.DataFrame(sim.agent_metrics.get("MovingUser", []))
     df_bs = pd.DataFrame(sim.agent_metrics.get("MonitoredBaseStation", []))
 
-    return sim, df_servers, df_users, df_bs
+    if sim.lstm_history:
+        df_acc = pd.DataFrame(sim.lstm_history, columns=["Time Step", "Accuracy"])
+        df_acc = df_acc.groupby("Time Step")["Accuracy"].last().reset_index()
+    else:
+        df_acc = pd.DataFrame(columns=["Time Step", "Accuracy"])
+
+    return sim, df_servers, df_users, df_bs, df_acc
 
 
 if __name__ == "__main__":
-    sim, df_srv, df_usr, df_bs = run_experiment_markov_edgesimpy(
-        n_users=2000,
+    sim, df_srv, df_usr, df_bs, df_acc = run_experiment_lstm_edgesimpy(
+        n_users=200,
         max_steps=800,
         max_fog_distance=150,
         delay_sla=15
     )
 
-    df_srv.to_csv("experiment_markov_servers_built_in.csv", index=False)
-    df_usr.to_csv("experiment_markov_users_built_in.csv", index=False)
-    df_bs.to_csv("experiment_markov_basestations_built_in.csv", index=False)
+    df_srv.to_csv("experiment_lstm_servers_built_in.csv", index=False)
+    df_usr.to_csv("experiment_lstm_users_built_in.csv", index=False)
+    df_bs.to_csv("experiment_lstm_basestations_built_in.csv", index=False)
+    df_acc.to_csv("experiment_lstm_accuracy.csv", index=False)
 
-    print("Saved CSVs for servers, users, base stations.")
+    print("Saved CSVs for servers, users, base stations, and LSTM accuracy.")
+
+    if sim.lstm_step > 0:
+        print(f"LSTM accuracy over run: {sim.lstm_correct / sim.lstm_step:.3f}")
+    else:
+        print("No LSTM predictions made.")
 
     fig, axes = plt.subplots(3, 2, figsize=(18, 15))
-    fig.suptitle("Simulation Results Dashboard (Markov Model)", fontsize=16)
+    fig.suptitle("Simulation Results Dashboard (LSTM Online Learning)", fontsize=16)
 
     plot_server_cpu(df_srv, axes[0, 0])
     plot_server_energy(df_srv, axes[0, 1])
@@ -650,7 +765,13 @@ if __name__ == "__main__":
     plot_reallocations(df_usr, axes[2, 1])
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig("simulation_dashboard_markov.png")
-    print("Saved dashboard → simulation_dashboard_markov.png")
+    plt.savefig("simulation_dashboard_lstm.png")
+    print("Saved dashboard → simulation_dashboard_lstm.png")
 
-    # plt.show()
+    plt.figure(figsize=(8, 5))
+    plot_lstm_accuracy(df_acc, plt.gca())
+    plt.tight_layout()
+    plt.savefig("lstm_accuracy_over_time.png")
+    print("Saved LSTM accuracy plot → lstm_accuracy_over_time.png")
+
+    plt.show()
